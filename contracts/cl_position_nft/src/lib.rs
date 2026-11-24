@@ -808,11 +808,21 @@ impl ClPositionNft {
     }
 
     /// Returns whether `owner` accepts incoming transfers (true by default).
+    ///
+    /// An explicit opt-out is a security/compliance preference, so a recorded
+    /// value is bumped on every read; otherwise the entry could be evicted and
+    /// the getter would silently fall back to `true`, re-enabling transfers the
+    /// owner refused. Absent entries stay absent — the default is `true` and
+    /// there is nothing to keep alive.
     pub fn accepts_transfers(env: Env, owner: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AcceptTransfers(owner))
-            .unwrap_or(true)
+        let key = DataKey::AcceptTransfers(owner);
+        match env.storage().persistent().get::<_, bool>(&key) {
+            Some(accepts) => {
+                Self::bump_persistent(&env, &key);
+                accepts
+            }
+            None => true,
+        }
     }
 
     /// Set whether this address accepts incoming NFT transfers.
@@ -1304,6 +1314,41 @@ mod tests {
         client.set_approval_for_all(&receiver, &operator, &true);
         client.transfer(&operator, &owner, &receiver, &id);
         assert_eq!(client.owner_of(&id), receiver);
+    }
+
+    /// An explicit opt-out must not lapse just because nobody touched the
+    /// contract for a while: reading it has to renew its TTL before the entry
+    /// can fall out of the ledger and silently revert to the default `true`.
+    #[test]
+    fn accepts_transfers_renews_opt_out_across_ttl_lapse() {
+        use soroban_sdk::testutils::{storage::Persistent as _, Ledger as _};
+
+        let (env, client, _admin, _pool, _) = setup();
+        let opted_out = Address::generate(&env);
+        let never_opted_out = Address::generate(&env);
+        client.set_accept_transfers(&opted_out, &false);
+
+        // Drop the entry's remaining TTL below DEFAULT_MIN_TTL without letting
+        // it expire (~150 days of no traffic at the default parameters).
+        env.ledger().with_mut(|li| {
+            li.sequence_number +=
+                ClPositionNft::DEFAULT_BUMP_TO - ClPositionNft::DEFAULT_MIN_TTL + 1
+        });
+
+        assert!(!client.accepts_transfers(&opted_out));
+        // An address that never opted out keeps the default.
+        assert!(client.accepts_transfers(&never_opted_out));
+
+        env.as_contract(&client.address, || {
+            let ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::AcceptTransfers(opted_out.clone()));
+            assert!(
+                ttl >= ClPositionNft::DEFAULT_BUMP_TO - 1,
+                "AcceptTransfers TTL {ttl} should be bumped toward DEFAULT_BUMP_TO"
+            );
+        });
     }
 
     #[test]
